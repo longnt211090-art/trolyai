@@ -134,8 +134,43 @@ async function callExternalAI(platform, apiKey, model, messages, systemPrompt = 
 }
 
 // ── CHAT ─────────────────────────────────────────────────────────────────────
+// Lưu API configs vào localStorage để ChatTab dùng được
+function getSavedConfigs() {
+  try { return JSON.parse(localStorage.getItem("ai_configs") || "{}"); } catch { return {}; }
+}
+function getActiveAI() {
+  const saved = getSavedConfigs();
+  // Ưu tiên: Claude env → Mistral → OpenAI → Gemini
+  const envKey = typeof import.meta !== "undefined" ? import.meta.env?.VITE_ANTHROPIC_KEY : null;
+  if (envKey && envKey.startsWith("sk-ant")) return { type: "claude", key: envKey };
+  for (const pid of ["mistral", "openai", "gemini"]) {
+    if (saved[pid]?.apiKey && saved[pid]?.connected) {
+      return { type: pid, key: saved[pid].apiKey, model: saved[pid].model };
+    }
+  }
+  return null;
+}
+
+async function callActiveAI(messages) {
+  const active = getActiveAI();
+  if (!active) return "⚠️ Chưa kết nối AI nào!\nVào tab ⬡ Kết Nối → nhập API Key → Test kết nối trước nhé.";
+  if (active.type === "claude") return callClaude(messages);
+  const platform = AI_PLATFORMS.find(p => p.id === active.type);
+  return callExternalAI(platform, active.key, active.model || platform.defaultModel, messages);
+}
+
 function ChatTab() {
-  const [messages, setMessages] = useState([{ role: "assistant", content: "Xin chào! Tôi là trợ lý AI của bạn. Hỏi bất cứ điều gì nhé ✦" }]);
+  const activeAI = getActiveAI();
+  const activePlatform = activeAI ? AI_PLATFORMS.find(p => p.id === activeAI.type) : null;
+  const aiName = activePlatform?.name || "AI";
+  const aiColor = activePlatform?.color || "#ffd86e";
+
+  const [messages, setMessages] = useState([{
+    role: "assistant",
+    content: activeAI
+      ? `Xin chào! Đang dùng ${aiName} — hỏi bất cứ điều gì nhé ✦`
+      : "⚠️ Chưa kết nối AI!\nVào tab ⬡ Kết Nối → nhập API Key → Test kết nối."
+  }]);
   const [input, setInput] = useState(""); const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
@@ -143,20 +178,28 @@ function ChatTab() {
     const msg = text || input.trim(); if (!msg) return;
     setInput("");
     const next = [...messages, { role: "user", content: msg }]; setMessages(next); setLoading(true);
-    const reply = await callClaude(next.slice(1).map(m => ({ role: m.role, content: m.content })));
+    const reply = await callActiveAI(next.slice(1).map(m => ({ role: m.role, content: m.content })));
     setMessages([...next, { role: "assistant", content: reply }]); setLoading(false);
   };
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={{ padding: "10px 14px 8px", borderBottom: "1px solid rgba(255,220,100,0.1)" }}>
+      {/* AI indicator + quick prompts */}
+      <div style={{ padding: "8px 14px", borderBottom: "1px solid rgba(255,220,100,0.1)" }}>
+        {/* Active AI badge */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7 }}>
+          <div style={{ width: 7, height: 7, borderRadius: "50%", background: activeAI ? aiColor : "#ff6b6b", boxShadow: `0 0 5px ${activeAI ? aiColor : "#ff6b6b"}` }} />
+          <span style={{ color: activeAI ? aiColor : "#ff6b6b", fontSize: 11, fontWeight: 600 }}>
+            {activeAI ? `Đang dùng: ${aiName}` : "Chưa kết nối AI — vào tab ⬡ Kết Nối"}
+          </span>
+        </div>
         <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 2 }}>
-          {QUICK_PROMPTS.map(q => <button key={q} onClick={() => send(q)} style={{ flexShrink: 0, background: "rgba(255,220,100,0.08)", border: "1px solid rgba(255,220,100,0.2)", borderRadius: 20, color: "#ffd86e", fontSize: 11, padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap", fontFamily: "inherit" }}>{q}</button>)}
+          {QUICK_PROMPTS.map(q => <button key={q} onClick={() => send(q)} style={{ flexShrink: 0, background: `${aiColor}14`, border: `1px solid ${aiColor}33`, borderRadius: 20, color: aiColor, fontSize: 11, padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap", fontFamily: "inherit" }}>{q}</button>)}
         </div>
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: 10 }}>
         {messages.map((m, i) => (
           <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
-            <div style={{ maxWidth: "82%", padding: "10px 14px", borderRadius: m.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px", background: m.role === "user" ? "linear-gradient(135deg,#ffd86e,#ffb347)" : "rgba(255,255,255,0.06)", color: m.role === "user" ? "#1a1410" : "#e8dcc8", fontSize: 13.5, lineHeight: 1.55, border: m.role === "assistant" ? "1px solid rgba(255,220,100,0.15)" : "none", whiteSpace: "pre-wrap" }}>{m.content}</div>
+            <div style={{ maxWidth: "82%", padding: "10px 14px", borderRadius: m.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px", background: m.role === "user" ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,255,255,0.06)", color: m.role === "user" ? "#1a1410" : "#e8dcc8", fontSize: 13.5, lineHeight: 1.55, border: m.role === "assistant" ? `1px solid ${aiColor}22` : "none", whiteSpace: "pre-wrap" }}>{m.content}</div>
           </div>
         ))}
         {loading && <div style={{ display: "flex", gap: 5, padding: "10px 14px" }}>{[0,1,2].map(i => <div key={i} style={{ width: 7, height: 7, borderRadius: "50%", background: "#ffd86e", animation: "bounce 1.2s infinite", animationDelay: `${i*0.2}s` }} />)}</div>}
@@ -264,11 +307,14 @@ function EntertainTab() {
 // ── CONNECT TAB ───────────────────────────────────────────────────────────────
 function ConnectTab() {
   const [configs, setConfigs] = useState(() => {
-    const saved = {};
-    AI_PLATFORMS.forEach(p => { saved[p.id] = { apiKey: "", model: p.defaultModel, connected: false }; });
-    saved["claude"].connected = true;
-    saved["claude"].apiKey = "managed";
-    return saved;
+    const saved = getSavedConfigs();
+    const initial = {};
+    AI_PLATFORMS.forEach(p => {
+      initial[p.id] = saved[p.id] || { apiKey: "", model: p.defaultModel, connected: false };
+    });
+    initial["claude"].connected = true;
+    initial["claude"].apiKey = "managed";
+    return initial;
   });
   const [selected, setSelected] = useState(null);
   const [testMsg, setTestMsg] = useState("");
@@ -290,7 +336,13 @@ function ConnectTab() {
     const reply = await callExternalAI(platform, cfg.apiKey, cfg.model, [{ role: "user", content: "Xin chào! Trả lời 1 câu ngắn tiếng Việt." }]);
     const ok = !reply.startsWith("❌");
     setTestResult(ok ? `✅ Kết nối thành công!\n${reply}` : reply);
-    if (ok) updateConfig(platform.id, "connected", true);
+    if (ok) {
+      updateConfig(platform.id, "connected", true);
+      // Lưu vào localStorage để ChatTab dùng được
+      const saved = getSavedConfigs();
+      saved[platform.id] = { apiKey: cfg.apiKey, model: cfg.model, connected: true };
+      localStorage.setItem("ai_configs", JSON.stringify(saved));
+    }
     setTesting(false);
   };
 
