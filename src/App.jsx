@@ -5,8 +5,102 @@ const TABS = [
   { id: "tasks", label: "Việc Làm", icon: "◈" },
   { id: "office", label: "Văn Phòng", icon: "◉" },
   { id: "entertain", label: "Giải Trí", icon: "◎" },
+  { id: "memory", label: "Bộ Nhớ", icon: "◍" },
   { id: "connect", label: "Kết Nối", icon: "⬡" },
 ];
+
+// ── MEMORY ENGINE ─────────────────────────────────────────────────────────────
+const MEMORY_KEY = "ai_memory_v1";
+const CHAT_HISTORY_KEY = "ai_chat_history";
+
+function getMemory() {
+  try { return JSON.parse(localStorage.getItem(MEMORY_KEY) || "{}"); } catch { return {}; }
+}
+function saveMemory(mem) {
+  localStorage.setItem(MEMORY_KEY, JSON.stringify(mem));
+}
+function getChatHistory() {
+  try { return JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || "[]"); } catch { return []; }
+}
+function saveChatHistory(history) {
+  localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(history.slice(-200)));
+}
+
+async function autoExtractMemory(userMsg, aiReply) {
+  if (!userMsg || userMsg.length < 10) return;
+  const mem = getMemory();
+  const prompt = `Phân tích và trích xuất thông tin cá nhân quan trọng cần ghi nhớ lâu dài.
+Người dùng: "${userMsg.slice(0,300)}"
+AI: "${aiReply.slice(0,300)}"
+Trả về JSON hợp lệ (không markdown):
+{"facts":["fact ngắn gọn"],"topics":["chủ đề"],"preferences":["sở thích"],"shouldSave":true/false}
+Chỉ ghi nếu có: tên, nghề, sở thích, thói quen, vấn đề thường gặp. Không ghi câu hỏi chung.`;
+  try {
+    const reply = await callClaude([{ role: "user", content: prompt }],
+      "Trích xuất JSON thông tin người dùng. Chỉ JSON, không markdown.");
+    const clean = reply.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    if (!parsed.shouldSave) return;
+    const now = new Date().toLocaleDateString("vi-VN");
+    if (parsed.facts?.length) {
+      mem.facts = mem.facts || [];
+      parsed.facts.forEach(f => {
+        if (f && !mem.facts.find(x => x.text === f))
+          mem.facts.push({ text: f, date: now, count: 1 });
+        else if (f) { const ex = mem.facts.find(x => x.text === f); if(ex) ex.count = (ex.count||1)+1; }
+      });
+      mem.facts = mem.facts.slice(-50);
+    }
+    if (parsed.topics?.length) {
+      mem.topics = mem.topics || {};
+      parsed.topics.forEach(t => { if(t) mem.topics[t] = (mem.topics[t]||0)+1; });
+    }
+    if (parsed.preferences?.length) {
+      mem.preferences = mem.preferences || [];
+      parsed.preferences.forEach(p => {
+        if (p && !mem.preferences.find(x => x.text === p))
+          mem.preferences.push({ text: p, date: now });
+      });
+      mem.preferences = mem.preferences.slice(-30);
+    }
+    mem.lastUpdated = now;
+    mem.totalChats = (mem.totalChats||0)+1;
+    saveMemory(mem);
+  } catch {}
+}
+
+function buildMemorySystemPrompt(base = "") {
+  const mem = getMemory();
+  const parts = [];
+  if (mem.facts?.length) parts.push("Thông tin người dùng:\n" + mem.facts.slice(-10).map(f=>`- ${f.text}`).join("\n"));
+  if (mem.preferences?.length) parts.push("Sở thích:\n" + mem.preferences.slice(-5).map(p=>`- ${p.text}`).join("\n"));
+  if (mem.topics && Object.keys(mem.topics).length) {
+    const top = Object.entries(mem.topics).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k])=>k).join(", ");
+    parts.push("Hay hỏi về: " + top);
+  }
+  const ctx = parts.length ? "\n\n[BỘ NHỚ CÁ NHÂN - dùng để cá nhân hóa phản hồi]\n" + parts.join("\n\n") : "";
+  return (base || "Bạn là trợ lý AI cá nhân cho người đi làm Việt Nam. Trả lời ngắn gọn, thực tế, tiếng Việt.") + ctx;
+}
+
+async function callAIWithMemory(messages) {
+  const active = getActiveAI();
+  if (!active) return "⚠️ Chưa kết nối AI nào!\nVào tab ⬡ Kết Nối → nhập API Key → Test kết nối trước nhé.";
+  const systemPrompt = buildMemorySystemPrompt();
+  const history = getChatHistory();
+  const fullMessages = [...history.slice(-16), ...messages].slice(-30);
+  let reply;
+  if (active.type === "claude") reply = await callClaude(fullMessages, systemPrompt);
+  else {
+    const platform = AI_PLATFORMS.find(p => p.id === active.type);
+    reply = await callExternalAI(platform, active.key, active.model || platform.defaultModel, fullMessages, systemPrompt);
+  }
+  const lastUser = messages[messages.length-1];
+  if (lastUser) {
+    saveChatHistory([...history, lastUser, { role:"assistant", content: reply }]);
+    autoExtractMemory(lastUser.content, reply);
+  }
+  return reply;
+}
 
 const OFFICE_TEMPLATES = [
   { id: "email", label: "Soạn Email", prompt: "Soạn email chuyên nghiệp về: " },
@@ -133,6 +227,81 @@ async function callExternalAI(platform, apiKey, model, messages, systemPrompt = 
   }
 }
 
+// ── GEMINI IMAGE GENERATION ───────────────────────────────────────────────────
+async function generateImageGemini(prompt) {
+  const saved = getSavedConfigs();
+  const geminiKey = saved["gemini"]?.apiKey;
+  if (!geminiKey) return { error: "⚠️ Cần kết nối Gemini API trước!
+Vào tab ⬡ Kết Nối → Gemini → nhập key." };
+
+  const model = "gemini-2.5-flash-image";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Goog-Api-Key": geminiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `❌ Lỗi ${res.status}: ${data.error?.message || "Không tạo được ảnh"}` };
+    const parts = data.candidates?.[0]?.content?.parts || [];
+    let imageBase64 = null, mimeType = "image/png", textReply = "";
+    for (const part of parts) {
+      if (part.inlineData) { imageBase64 = part.inlineData.data; mimeType = part.inlineData.mimeType || "image/png"; }
+      if (part.text) textReply = part.text;
+    }
+    if (!imageBase64) return { error: "❌ Không nhận được ảnh từ Gemini. Thử lại với prompt khác." };
+    return { imageBase64, mimeType, textReply, dataUrl: `data:${mimeType};base64,${imageBase64}` };
+  } catch (e) {
+    return { error: `❌ Lỗi: ${e.message}` };
+  }
+}
+
+async function generateVideoGemini(prompt) {
+  const saved = getSavedConfigs();
+  const geminiKey = saved["gemini"]?.apiKey;
+  if (!geminiKey) return { error: "⚠️ Cần kết nối Gemini API trước!" };
+  // Veo 3.1 - video generation (polling based)
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/veo-3.1-generate-preview:predictLongRunning";
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Goog-Api-Key": geminiKey },
+      body: JSON.stringify({ instances: [{ prompt }], parameters: { aspectRatio: "16:9", durationSeconds: 5 } }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `❌ Lỗi ${res.status}: ${data.error?.message || "Video API lỗi"}` };
+    return { operationName: data.name, status: "pending" };
+  } catch (e) {
+    return { error: `❌ Lỗi: ${e.message}` };
+  }
+}
+
+async function pollVideoOperation(operationName, apiKey) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/${operationName}`;
+  try {
+    const res = await fetch(url, { headers: { "X-Goog-Api-Key": apiKey } });
+    const data = await res.json();
+    if (data.done && data.response) {
+      const videoData = data.response.predictions?.[0]?.bytesBase64Encoded;
+      const mimeType = data.response.predictions?.[0]?.mimeType || "video/mp4";
+      if (videoData) return { done: true, videoBase64: videoData, mimeType, dataUrl: `data:${mimeType};base64,${videoData}` };
+    }
+    if (data.error) return { done: true, error: `❌ ${data.error.message}` };
+    return { done: false };
+  } catch (e) {
+    return { done: true, error: `❌ ${e.message}` };
+  }
+}
+
+function downloadFile(dataUrl, filename) {
+  const a = document.createElement("a");
+  a.href = dataUrl; a.download = filename; a.click();
+}
+
 // ── CHAT ─────────────────────────────────────────────────────────────────────
 // Lưu API configs vào localStorage để ChatTab dùng được
 function getSavedConfigs() {
@@ -152,11 +321,7 @@ function getActiveAI() {
 }
 
 async function callActiveAI(messages) {
-  const active = getActiveAI();
-  if (!active) return "⚠️ Chưa kết nối AI nào!\nVào tab ⬡ Kết Nối → nhập API Key → Test kết nối trước nhé.";
-  if (active.type === "claude") return callClaude(messages);
-  const platform = AI_PLATFORMS.find(p => p.id === active.type);
-  return callExternalAI(platform, active.key, active.model || platform.defaultModel, messages);
+  return callAIWithMemory(messages);
 }
 
 // Convert file to base64
@@ -227,8 +392,10 @@ function ChatTab() {
   }]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [mediaFiles, setMediaFiles] = useState([]); // [{type, name, url, base64, mimeType, size}]
+  const [mediaFiles, setMediaFiles] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [genMode, setGenMode] = useState("chat"); // "chat" | "image" | "video"
+  const [videoPolling, setVideoPolling] = useState(null);
   const fileInputRef = useRef(null);
   const bottomRef = useRef(null);
 
@@ -257,20 +424,63 @@ function ChatTab() {
     if (!msg && mediaFiles.length === 0) return;
     setInput("");
 
-    // Build display message
+    // IMAGE GENERATION MODE
+    if (genMode === "image") {
+      const prompt = msg;
+      const userMsg = { role: "user", content: `🎨 Tạo ảnh: "${prompt}"`, genType: "image_request" };
+      const next = [...messages, userMsg];
+      setMessages(next); setLoading(true);
+      const result = await generateImageGemini(prompt);
+      if (result.error) {
+        setMessages([...next, { role: "assistant", content: result.error }]);
+      } else {
+        setMessages([...next, { role: "assistant", content: result.textReply || "✅ Ảnh đã tạo xong!", genType: "image_result", imageDataUrl: result.dataUrl, imageMime: result.mimeType }]);
+      }
+      setLoading(false); return;
+    }
+
+    // VIDEO GENERATION MODE
+    if (genMode === "video") {
+      const prompt = msg;
+      const userMsg = { role: "user", content: `🎬 Tạo video: "${prompt}"`, genType: "video_request" };
+      const next = [...messages, userMsg];
+      setMessages(next); setLoading(true);
+      const result = await generateVideoGemini(prompt);
+      if (result.error) {
+        setMessages([...next, { role: "assistant", content: result.error }]);
+        setLoading(false); return;
+      }
+      // Poll for video completion
+      const saved = getSavedConfigs();
+      const geminiKey = saved["gemini"]?.apiKey;
+      setMessages([...next, { role: "assistant", content: "⏳ Đang tạo video... (~30-60 giây)", genType: "video_pending" }]);
+      setLoading(false);
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        const pollResult = await pollVideoOperation(result.operationName, geminiKey);
+        if (pollResult.done || attempts > 24) {
+          clearInterval(poll); setVideoPolling(null);
+          if (pollResult.error || attempts > 24) {
+            setMessages(prev => [...prev.slice(0,-1), { role: "assistant", content: pollResult.error || "❌ Hết thời gian chờ. Thử lại nhé." }]);
+          } else {
+            setMessages(prev => [...prev.slice(0,-1), { role: "assistant", content: "✅ Video đã tạo xong! Nhấn tải về.", genType: "video_result", videoDataUrl: pollResult.dataUrl, videoMime: pollResult.mimeType }]);
+          }
+        }
+      }, 5000);
+      setVideoPolling(poll);
+      return;
+    }
+
+    // CHAT MODE (default)
     const displayContent = msg || (mediaFiles.length > 0 ? `[Đã gửi ${mediaFiles.length} file]` : "");
     const userMsg = { role: "user", content: displayContent, media: mediaFiles };
     const next = [...messages, userMsg];
-    setMessages(next);
-    setLoading(true);
-
+    setMessages(next); setLoading(true);
     const apiMessages = next.slice(1).map(m => ({ role: m.role, content: m.content }));
     let reply;
-    if (mediaFiles.length > 0) {
-      reply = await callClaudeVision(apiMessages, mediaFiles);
-    } else {
-      reply = await callActiveAI(apiMessages);
-    }
+    if (mediaFiles.length > 0) reply = await callClaudeVision(apiMessages, mediaFiles);
+    else reply = await callActiveAI(apiMessages);
     setMediaFiles([]);
     setMessages([...next, { role: "assistant", content: reply }]);
     setLoading(false);
@@ -323,7 +533,28 @@ function ChatTab() {
               </div>
             )}
             {m.content && (
-              <div style={{ maxWidth: "82%", padding: "9px 13px", borderRadius: m.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px", background: m.role === "user" ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,255,255,0.06)", color: m.role === "user" ? "#1a1410" : "#e8dcc8", fontSize: 13.5, lineHeight: 1.55, border: m.role === "assistant" ? `1px solid ${aiColor}22` : "none", whiteSpace: "pre-wrap" }}>{m.content}</div>
+              <div style={{ maxWidth: "88%", display: "flex", flexDirection: "column", gap: 8, alignItems: m.role === "user" ? "flex-end" : "flex-start" }}>
+                {/* Generated Image */}
+                {m.genType === "image_result" && m.imageDataUrl && (
+                  <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${aiColor}44`, maxWidth: 260 }}>
+                    <img src={m.imageDataUrl} alt="AI generated" style={{ width: "100%", display: "block" }} />
+                    <div style={{ display: "flex", gap: 6, padding: "8px 10px", background: "rgba(0,0,0,0.3)" }}>
+                      <button onClick={() => downloadFile(m.imageDataUrl, `ai-image-${Date.now()}.png`)} style={{ flex: 1, background: `linear-gradient(135deg,${aiColor},${aiColor}bb)`, border: "none", borderRadius: 8, color: "#1a1410", padding: "7px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>⬇ Tải ảnh</button>
+                      <button onClick={() => { const w = window.open(); w.document.write(`<img src="${m.imageDataUrl}" style="max-width:100%">`); }} style={{ flex: 1, background: "rgba(255,255,255,0.1)", border: `1px solid ${aiColor}33`, borderRadius: 8, color: aiColor, padding: "7px", fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>🔍 Phóng to</button>
+                    </div>
+                  </div>
+                )}
+                {/* Generated Video */}
+                {m.genType === "video_result" && m.videoDataUrl && (
+                  <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${aiColor}44`, maxWidth: 260 }}>
+                    <video src={m.videoDataUrl} controls style={{ width: "100%", display: "block", maxHeight: 180 }} />
+                    <div style={{ padding: "8px 10px", background: "rgba(0,0,0,0.3)" }}>
+                      <button onClick={() => downloadFile(m.videoDataUrl, `ai-video-${Date.now()}.mp4`)} style={{ width: "100%", background: `linear-gradient(135deg,${aiColor},${aiColor}bb)`, border: "none", borderRadius: 8, color: "#1a1410", padding: "7px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>⬇ Tải video</button>
+                    </div>
+                  </div>
+                )}
+                <div style={{ maxWidth: "100%", padding: "9px 13px", borderRadius: m.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px", background: m.role === "user" ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,255,255,0.06)", color: m.role === "user" ? "#1a1410" : "#e8dcc8", fontSize: 13.5, lineHeight: 1.55, border: m.role === "assistant" ? `1px solid ${aiColor}22` : "none", whiteSpace: "pre-wrap" }}>{m.content}</div>
+              </div>
             )}
           </div>
         ))}
@@ -350,27 +581,39 @@ function ChatTab() {
         </div>
       )}
 
+      {/* Mode selector */}
+      <div style={{ padding: "6px 14px 0", borderTop: mediaFiles.length > 0 ? "none" : "1px solid rgba(255,220,100,0.08)", display: "flex", gap: 5, flexShrink: 0 }}>
+        {[
+          { id: "chat", label: "💬 Chat", color: aiColor },
+          { id: "image", label: "🎨 Tạo ảnh", color: "#c792ea" },
+          { id: "video", label: "🎬 Tạo video", color: "#82aaff" },
+        ].map(m => (
+          <button key={m.id} onClick={() => setGenMode(m.id)} style={{ padding: "5px 11px", borderRadius: 14, background: genMode === m.id ? `${m.color}22` : "transparent", border: `1px solid ${genMode === m.id ? m.color + "66" : "rgba(255,255,255,0.06)"}`, color: genMode === m.id ? m.color : "#555", fontSize: 11, cursor: "pointer", fontFamily: "inherit", fontWeight: genMode === m.id ? 700 : 400, transition: "all 0.15s", whiteSpace: "nowrap" }}>{m.label}</button>
+        ))}
+        {genMode !== "chat" && <span style={{ color: "#444", fontSize: 10.5, alignSelf: "center", marginLeft: 2 }}>{genMode === "image" ? "Gemini · ~500/ngày miễn phí" : "Gemini Veo · ~30-60s"}</span>}
+      </div>
+
       {/* Input bar */}
-      <div style={{ padding: "8px 14px 10px", borderTop: mediaFiles.length > 0 ? "none" : "1px solid rgba(255,220,100,0.1)", display: "flex", alignItems: "flex-end", gap: 8 }}>
+      <div style={{ padding: "6px 14px 10px", display: "flex", alignItems: "flex-end", gap: 8 }}>
         {/* Hidden file input */}
         <input ref={fileInputRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={e => processFiles(e.target.files)} />
 
-        {/* Attach button */}
-        <button onClick={() => fileInputRef.current?.click()} style={{ width: 38, height: 38, borderRadius: 12, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#888", fontSize: 17, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.2s" }}
-          onMouseEnter={e => { e.target.style.borderColor = aiColor; e.target.style.color = aiColor; }}
-          onMouseLeave={e => { e.target.style.borderColor = "rgba(255,255,255,0.1)"; e.target.style.color = "#888"; }}>
-          📎
-        </button>
+        {/* Attach button - only in chat mode */}
+        {genMode === "chat" && (
+          <button onClick={() => fileInputRef.current?.click()} style={{ width: 38, height: 38, borderRadius: 12, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#888", fontSize: 17, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>📎</button>
+        )}
 
         {/* Text input */}
         <textarea value={input} onChange={e => setInput(e.target.value)}
           onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-          placeholder="Nhắn tin, hoặc kéo thả ảnh/video vào đây..." rows={1}
-          style={{ flex: 1, background: "rgba(255,255,255,0.06)", border: `1px solid ${isDragging ? aiColor : "rgba(255,220,100,0.2)"}`, borderRadius: 18, color: "#e8dcc8", padding: "10px 14px", fontSize: 13, outline: "none", fontFamily: "inherit", resize: "none", lineHeight: 1.4, maxHeight: 80, overflowY: "auto" }}
+          placeholder={genMode === "image" ? "Mô tả ảnh muốn tạo... (vd: mèo Ba Tư mặc đầm đỏ, cute)" : genMode === "video" ? "Mô tả video muốn tạo... (vd: mèo đang chạy trong vườn)" : "Nhắn tin, hoặc kéo thả ảnh/video vào đây..."} rows={1}
+          style={{ flex: 1, background: genMode === "image" ? "rgba(199,146,234,0.06)" : genMode === "video" ? "rgba(130,170,255,0.06)" : "rgba(255,255,255,0.06)", border: `1px solid ${genMode === "image" ? "rgba(199,146,234,0.3)" : genMode === "video" ? "rgba(130,170,255,0.3)" : isDragging ? aiColor : "rgba(255,220,100,0.2)"}`, borderRadius: 18, color: "#e8dcc8", padding: "10px 14px", fontSize: 13, outline: "none", fontFamily: "inherit", resize: "none", lineHeight: 1.4, maxHeight: 80, overflowY: "auto" }}
         />
 
         {/* Send button */}
-        <button onClick={() => send()} disabled={!canSend} style={{ width: 38, height: 38, borderRadius: "50%", background: canSend ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,220,100,0.08)", border: "none", color: canSend ? "#1a1410" : "#555", fontSize: 16, cursor: canSend ? "pointer" : "not-allowed", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.2s" }}>↑</button>
+        <button onClick={() => send()} disabled={!canSend} style={{ width: 38, height: 38, borderRadius: "50%", background: canSend ? (genMode === "image" ? "linear-gradient(135deg,#c792ea,#9d6fd4)" : genMode === "video" ? "linear-gradient(135deg,#82aaff,#5580ff)" : `linear-gradient(135deg,${aiColor},${aiColor}bb)`) : "rgba(255,255,255,0.05)", border: "none", color: canSend ? "#1a1410" : "#555", fontSize: 16, cursor: canSend ? "pointer" : "not-allowed", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.2s" }}>
+          {genMode === "image" ? "✨" : genMode === "video" ? "🎬" : "↑"}
+        </button>
       </div>
     </div>
   );
@@ -643,6 +886,203 @@ function ConnectTab() {
   );
 }
 
+
+// ── MEMORY TAB ────────────────────────────────────────────────────────────────
+function MemoryTab() {
+  const [mem, setMem] = useState(getMemory());
+  const [history, setHistory] = useState(getChatHistory());
+  const [activeSection, setActiveSection] = useState("overview");
+  const [editingFact, setEditingFact] = useState(null);
+  const [newFact, setNewFact] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState("");
+
+  const refresh = () => { setMem(getMemory()); setHistory(getChatHistory()); };
+
+  const deleteFact = (idx) => {
+    const m = getMemory(); m.facts = m.facts.filter((_,i) => i !== idx);
+    saveMemory(m); refresh();
+  };
+  const addFact = () => {
+    if (!newFact.trim()) return;
+    const m = getMemory(); m.facts = m.facts || [];
+    m.facts.push({ text: newFact.trim(), date: new Date().toLocaleDateString("vi-VN"), count: 1, manual: true });
+    saveMemory(m); setNewFact(""); refresh();
+  };
+  const deleteTopic = (topic) => {
+    const m = getMemory(); delete m.topics[topic];
+    saveMemory(m); refresh();
+  };
+  const clearAll = () => {
+    if (!window.confirm("Xóa toàn bộ bộ nhớ AI?")) return;
+    localStorage.removeItem(MEMORY_KEY); localStorage.removeItem(CHAT_HISTORY_KEY); refresh();
+  };
+  const clearHistory = () => {
+    if (!window.confirm("Xóa lịch sử trò chuyện?")) return;
+    localStorage.removeItem(CHAT_HISTORY_KEY); refresh();
+  };
+
+  const analyzeProfile = async () => {
+    setAnalyzing(true); setAnalysisResult("");
+    const m = getMemory();
+    const facts = m.facts?.map(f=>f.text).join(", ") || "chưa có";
+    const topics = Object.entries(m.topics||{}).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${k}(${v})`).join(", ") || "chưa có";
+    const prefs = m.preferences?.map(p=>p.text).join(", ") || "chưa có";
+    const reply = await callClaude([{ role:"user", content:
+      `Dựa trên dữ liệu người dùng sau, hãy phân tích và đưa ra nhận xét về thói quen, sở thích, và gợi ý cá nhân hóa:
+Sự kiện: ${facts}
+Chủ đề hay hỏi: ${topics}
+Sở thích: ${prefs}
+Tổng chat: ${m.totalChats||0}
+
+Viết 3-4 dòng phân tích ngắn gọn, thực tế.`
+    }]);
+    setAnalysisResult(reply); setAnalyzing(false);
+  };
+
+  const topTopics = Object.entries(mem.topics||{}).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const totalFacts = (mem.facts||[]).length;
+  const totalPrefs = (mem.preferences||[]).length;
+  const totalTopics = Object.keys(mem.topics||{}).length;
+
+  const SECTIONS = [
+    { id:"overview", label:"Tổng quan" },
+    { id:"facts", label:`Sự kiện (${totalFacts})` },
+    { id:"topics", label:`Chủ đề (${totalTopics})` },
+    { id:"history", label:`Lịch sử (${history.length})` },
+  ];
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", height:"100%" }}>
+      {/* Sub tabs */}
+      <div style={{ display:"flex", borderBottom:"1px solid rgba(199,146,234,0.1)", padding:"0 14px", flexShrink:0 }}>
+        {SECTIONS.map(s => (
+          <button key={s.id} onClick={() => setActiveSection(s.id)} style={{ flex:1, padding:"8px 2px 9px", background:"none", border:"none", borderBottom:`2px solid ${activeSection===s.id ? "#c792ea":"transparent"}`, color:activeSection===s.id ? "#c792ea":"#665f52", fontSize:10.5, cursor:"pointer", fontFamily:"inherit", fontWeight:activeSection===s.id?700:400 }}>{s.label}</button>
+        ))}
+      </div>
+
+      <div style={{ flex:1, overflowY:"auto", padding:14, display:"flex", flexDirection:"column", gap:11 }}>
+
+        {/* OVERVIEW */}
+        {activeSection === "overview" && <>
+          {/* Stats */}
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8 }}>
+            {[
+              { label:"Sự kiện", value:totalFacts, color:"#c792ea" },
+              { label:"Chủ đề", value:totalTopics, color:"#82aaff" },
+              { label:"Cuộc chat", value:mem.totalChats||0, color:"#69db7c" },
+            ].map(s => (
+              <div key={s.label} style={{ background:"rgba(255,255,255,0.04)", border:`1px solid ${s.color}22`, borderRadius:10, padding:"10px 8px", textAlign:"center" }}>
+                <div style={{ color:s.color, fontSize:20, fontWeight:700 }}>{s.value}</div>
+                <div style={{ color:"#665f52", fontSize:10, marginTop:2 }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* AI Analysis */}
+          <button onClick={analyzeProfile} disabled={analyzing} style={{ background:analyzing?"rgba(199,146,234,0.05)":"linear-gradient(135deg,#c792ea,#9d6fd4)", border:"none", borderRadius:10, color:analyzing?"#555":"#1a1410", padding:"11px", fontSize:13, fontWeight:700, cursor:analyzing?"not-allowed":"pointer", fontFamily:"inherit" }}>
+            {analyzing ? "Đang phân tích..." : "◍ AI phân tích hồ sơ của bạn"}
+          </button>
+          {analysisResult && <div style={{ background:"rgba(199,146,234,0.06)", border:"1px solid rgba(199,146,234,0.2)", borderRadius:10, padding:"12px 13px", color:"#dbb8f5", fontSize:13, lineHeight:1.65, whiteSpace:"pre-wrap" }}>{analysisResult}</div>}
+
+          {/* Top topics */}
+          {topTopics.length > 0 && <div>
+            <div style={{ color:"#665f52", fontSize:10, letterSpacing:1, textTransform:"uppercase", marginBottom:8 }}>Hay hỏi nhất</div>
+            <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+              {topTopics.map(([topic, count]) => (
+                <span key={topic} style={{ background:"rgba(130,170,255,0.1)", border:"1px solid rgba(130,170,255,0.2)", borderRadius:12, color:"#82aaff", fontSize:11, padding:"3px 9px" }}>
+                  {topic} <span style={{ opacity:0.6 }}>×{count}</span>
+                </span>
+              ))}
+            </div>
+          </div>}
+
+          {/* Last updated */}
+          {mem.lastUpdated && <div style={{ color:"#444", fontSize:11, textAlign:"center" }}>Cập nhật lần cuối: {mem.lastUpdated}</div>}
+
+          {/* Danger zone */}
+          <div style={{ display:"flex", gap:8, marginTop:4 }}>
+            <button onClick={clearHistory} style={{ flex:1, background:"rgba(255,107,107,0.08)", border:"1px solid rgba(255,107,107,0.2)", borderRadius:9, color:"#ff9999", padding:"8px", fontSize:11.5, cursor:"pointer", fontFamily:"inherit" }}>Xóa lịch sử chat</button>
+            <button onClick={clearAll} style={{ flex:1, background:"rgba(255,107,107,0.08)", border:"1px solid rgba(255,107,107,0.2)", borderRadius:9, color:"#ff9999", padding:"8px", fontSize:11.5, cursor:"pointer", fontFamily:"inherit" }}>Xóa toàn bộ</button>
+          </div>
+        </>}
+
+        {/* FACTS */}
+        {activeSection === "facts" && <>
+          {/* Add manual fact */}
+          <div style={{ display:"flex", gap:7 }}>
+            <input value={newFact} onChange={e=>setNewFact(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addFact()} placeholder="Thêm thông tin thủ công..." style={{ flex:1, background:"rgba(255,255,255,0.05)", border:"1px solid rgba(199,146,234,0.25)", borderRadius:9, color:"#e8dcc8", padding:"8px 11px", fontSize:12.5, outline:"none", fontFamily:"inherit" }} />
+            <button onClick={addFact} style={{ background:"rgba(199,146,234,0.2)", border:"1px solid rgba(199,146,234,0.35)", borderRadius:9, color:"#c792ea", padding:"0 12px", cursor:"pointer", fontSize:15 }}>+</button>
+          </div>
+          <div style={{ color:"#555", fontSize:11 }}>✦ AI tự động học từ cuộc trò chuyện, hoặc bạn thêm thủ công</div>
+
+          {(mem.facts||[]).length === 0
+            ? <div style={{ color:"#444", fontSize:13, textAlign:"center", padding:20 }}>Chưa có gì — hãy chat để AI học về bạn!</div>
+            : (mem.facts||[]).slice().reverse().map((f, i) => (
+              <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:9, background:"rgba(199,146,234,0.05)", border:"1px solid rgba(199,146,234,0.12)", borderRadius:10, padding:"10px 12px" }}>
+                <div style={{ flex:1 }}>
+                  <div style={{ color:"#e8dcc8", fontSize:13 }}>{f.text}</div>
+                  <div style={{ color:"#555", fontSize:10, marginTop:3 }}>{f.date} {f.manual?"· Thủ công":"· Tự học"} {f.count>1?`· Nhắc ${f.count}x`:""}</div>
+                </div>
+                <button onClick={() => deleteFact((mem.facts||[]).length-1-i)} style={{ background:"none", border:"none", color:"#444", cursor:"pointer", fontSize:13, padding:0, flexShrink:0 }}>✕</button>
+              </div>
+            ))
+          }
+        </>}
+
+        {/* TOPICS */}
+        {activeSection === "topics" && <>
+          <div style={{ color:"#665f52", fontSize:11 }}>Chủ đề AI tự ghi nhận từ lịch sử trò chuyện</div>
+          {topTopics.length === 0
+            ? <div style={{ color:"#444", fontSize:13, textAlign:"center", padding:20 }}>Chưa có dữ liệu — hãy chat nhiều hơn!</div>
+            : topTopics.map(([topic, count]) => (
+              <div key={topic} style={{ display:"flex", alignItems:"center", gap:9, background:"rgba(130,170,255,0.05)", border:"1px solid rgba(130,170,255,0.1)", borderRadius:10, padding:"9px 12px" }}>
+                <div style={{ flex:1 }}>
+                  <div style={{ color:"#e8dcc8", fontSize:13 }}>{topic}</div>
+                  <div style={{ height:3, background:"rgba(130,170,255,0.1)", borderRadius:2, marginTop:5, overflow:"hidden" }}>
+                    <div style={{ height:"100%", width:`${Math.min(100, count*10)}%`, background:"linear-gradient(90deg,#82aaff,#c792ea)", borderRadius:2 }} />
+                  </div>
+                </div>
+                <span style={{ color:"#82aaff", fontSize:12, fontWeight:600, flexShrink:0 }}>×{count}</span>
+                <button onClick={() => deleteTopic(topic)} style={{ background:"none", border:"none", color:"#444", cursor:"pointer", fontSize:13, padding:0 }}>✕</button>
+              </div>
+            ))
+          }
+          {(mem.preferences||[]).length > 0 && <>
+            <div style={{ color:"#665f52", fontSize:10, letterSpacing:1, textTransform:"uppercase", marginTop:4 }}>Sở thích ghi nhận</div>
+            {(mem.preferences||[]).map((p, i) => (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:9, background:"rgba(105,219,124,0.04)", border:"1px solid rgba(105,219,124,0.1)", borderRadius:10, padding:"9px 12px" }}>
+                <span style={{ flex:1, color:"#e8dcc8", fontSize:13 }}>{p.text}</span>
+                <span style={{ color:"#555", fontSize:10 }}>{p.date}</span>
+              </div>
+            ))}
+          </>}
+        </>}
+
+        {/* HISTORY */}
+        {activeSection === "history" && <>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div style={{ color:"#665f52", fontSize:11 }}>{history.length} tin nhắn được lưu · AI dùng 20 tin gần nhất làm ngữ cảnh</div>
+            <button onClick={clearHistory} style={{ background:"none", border:"1px solid rgba(255,107,107,0.2)", borderRadius:7, color:"#ff9999", padding:"4px 9px", fontSize:11, cursor:"pointer", fontFamily:"inherit" }}>Xóa</button>
+          </div>
+          {history.length === 0
+            ? <div style={{ color:"#444", fontSize:13, textAlign:"center", padding:20 }}>Chưa có lịch sử trò chuyện</div>
+            : history.slice().reverse().slice(0,30).map((m, i) => (
+              <div key={i} style={{ display:"flex", gap:8, alignItems:"flex-start" }}>
+                <div style={{ width:6, height:6, borderRadius:"50%", background:m.role==="user"?"#c792ea":"#82aaff", marginTop:5, flexShrink:0 }} />
+                <div style={{ flex:1, background:"rgba(255,255,255,0.03)", borderRadius:8, padding:"7px 10px" }}>
+                  <div style={{ color:m.role==="user"?"#c792ea":"#82aaff", fontSize:9, marginBottom:3, textTransform:"uppercase", letterSpacing:0.5 }}>{m.role==="user"?"Bạn":"AI"}</div>
+                  <div style={{ color:"#b0a898", fontSize:12, lineHeight:1.5 }}>{typeof m.content==="string" ? m.content.slice(0,120)+(m.content.length>120?"...":"") : "[Media]"}</div>
+                </div>
+              </div>
+            ))
+          }
+        </>}
+      </div>
+    </div>
+  );
+}
+
 // ── ROOT ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [tab, setTab] = useState("chat");
@@ -673,7 +1113,7 @@ export default function App() {
         <div style={{ display: "flex", padding: "6px 10px 0", borderBottom: "1px solid rgba(255,220,100,0.08)", flexShrink: 0 }}>
           {TABS.map(t => {
             const isActive = tab === t.id;
-            const color = t.id === "entertain" ? "#ff9999" : t.id === "connect" ? "#82aaff" : "#ffd86e";
+            const color = t.id === "entertain" ? "#ff9999" : t.id === "connect" ? "#82aaff" : t.id === "memory" ? "#c792ea" : "#ffd86e";
             return (
               <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, padding: "5px 1px 8px", background: "none", border: "none", borderBottom: `2px solid ${isActive ? color : "transparent"}`, color: isActive ? color : "#555", fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: isActive ? 700 : 400, transition: "all 0.2s", display: "flex", alignItems: "center", justifyContent: "center", gap: 2 }}>
                 <span style={{ fontSize: 10 }}>{t.icon}</span>{t.label}
@@ -688,6 +1128,7 @@ export default function App() {
           {tab === "tasks" && <TasksTab />}
           {tab === "office" && <OfficeTab />}
           {tab === "entertain" && <EntertainTab />}
+          {tab === "memory" && <MemoryTab />}
           {tab === "connect" && <ConnectTab />}
         </div>
       </div>
