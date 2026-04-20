@@ -159,6 +159,63 @@ async function callActiveAI(messages) {
   return callExternalAI(platform, active.key, active.model || platform.defaultModel, messages);
 }
 
+// Convert file to base64
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// Call Claude with vision (image support)
+async function callClaudeVision(messages, mediaList) {
+  const active = getActiveAI();
+  const systemPrompt = "Bạn là trợ lý AI cá nhân cho người đi làm Việt Nam. Trả lời tiếng Việt, ngắn gọn thực tế.";
+
+  // Build last user message with media attachments
+  const lastMsg = messages[messages.length - 1];
+  const contentParts = [];
+
+  // Add media files
+  for (const media of mediaList) {
+    if (media.type === "image") {
+      contentParts.push({ type: "image", source: { type: "base64", media_type: media.mimeType, data: media.base64 } });
+    } else if (media.type === "video") {
+      // Video: describe it as text since most APIs don't support video
+      contentParts.push({ type: "text", text: `[Video đính kèm: ${media.name} — ${(media.size/1024/1024).toFixed(1)}MB. Hãy tư vấn dựa trên mô tả của tôi]` });
+    }
+  }
+  if (lastMsg?.content) contentParts.push({ type: "text", text: lastMsg.content });
+
+  // Build full message history
+  const apiMessages = messages.slice(0, -1).map(m => ({ role: m.role, content: m.content }));
+  apiMessages.push({ role: "user", content: contentParts });
+
+  if (!active || active.type === "claude") {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: systemPrompt, messages: apiMessages }),
+    });
+    const d = await res.json();
+    return d.content?.[0]?.text || "Có lỗi xảy ra.";
+  }
+
+  // For other AIs: convert image to OpenAI vision format
+  const platform = AI_PLATFORMS.find(p => p.id === active.type);
+  const openaiContent = [];
+  for (const media of mediaList) {
+    if (media.type === "image") openaiContent.push({ type: "image_url", image_url: { url: `data:${media.mimeType};base64,${media.base64}` } });
+    else openaiContent.push({ type: "text", text: `[Video: ${media.name}]` });
+  }
+  if (lastMsg?.content) openaiContent.push({ type: "text", text: lastMsg.content });
+
+  const body = { model: active.model || platform.defaultModel, max_tokens: 1000, messages: [{ role: "system", content: systemPrompt }, ...messages.slice(0, -1).map(m => ({ role: m.role, content: m.content })), { role: "user", content: openaiContent }] };
+  return callExternalAI(platform, active.key, active.model || platform.defaultModel, [], systemPrompt).catch(() => callClaude(apiMessages, systemPrompt));
+}
+
 function ChatTab() {
   const activeAI = getActiveAI();
   const activePlatform = activeAI ? AI_PLATFORMS.find(p => p.id === activeAI.type) : null;
@@ -166,48 +223,154 @@ function ChatTab() {
   const aiColor = activePlatform?.color || "#ffd86e";
 
   const [messages, setMessages] = useState([{
-    role: "assistant",
-    content: activeAI
-      ? `Xin chào! Đang dùng ${aiName} — hỏi bất cứ điều gì nhé ✦`
-      : "⚠️ Chưa kết nối AI!\nVào tab ⬡ Kết Nối → nhập API Key → Test kết nối."
+    role: "assistant", content: activeAI ? `Xin chào! Đang dùng ${aiName} — hỏi bất cứ điều gì nhé ✦` : "⚠️ Chưa kết nối AI!\nVào tab ⬡ Kết Nối → nhập API Key → Test kết nối."
   }]);
-  const [input, setInput] = useState(""); const [loading, setLoading] = useState(false);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [mediaFiles, setMediaFiles] = useState([]); // [{type, name, url, base64, mimeType, size}]
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef(null);
   const bottomRef = useRef(null);
+
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
-  const send = async (text) => {
-    const msg = text || input.trim(); if (!msg) return;
-    setInput("");
-    const next = [...messages, { role: "user", content: msg }]; setMessages(next); setLoading(true);
-    const reply = await callActiveAI(next.slice(1).map(m => ({ role: m.role, content: m.content })));
-    setMessages([...next, { role: "assistant", content: reply }]); setLoading(false);
+
+  const processFiles = async (files) => {
+    const newMedia = [];
+    for (const file of Array.from(files)) {
+      const isImage = file.type.startsWith("image/");
+      const isVideo = file.type.startsWith("video/");
+      if (!isImage && !isVideo) continue;
+      const base64 = await fileToBase64(file);
+      newMedia.push({ type: isImage ? "image" : "video", name: file.name, url: URL.createObjectURL(file), base64, mimeType: file.type, size: file.size });
+    }
+    setMediaFiles(prev => [...prev, ...newMedia].slice(0, 4)); // max 4 files
   };
+
+  const removeMedia = (idx) => setMediaFiles(prev => prev.filter((_, i) => i !== idx));
+
+  const handleDrop = (e) => { e.preventDefault(); setIsDragging(false); processFiles(e.dataTransfer.files); };
+  const handleDragOver = (e) => { e.preventDefault(); setIsDragging(true); };
+  const handleDragLeave = () => setIsDragging(false);
+
+  const send = async (text) => {
+    const msg = text || input.trim();
+    if (!msg && mediaFiles.length === 0) return;
+    setInput("");
+
+    // Build display message
+    const displayContent = msg || (mediaFiles.length > 0 ? `[Đã gửi ${mediaFiles.length} file]` : "");
+    const userMsg = { role: "user", content: displayContent, media: mediaFiles };
+    const next = [...messages, userMsg];
+    setMessages(next);
+    setLoading(true);
+
+    const apiMessages = next.slice(1).map(m => ({ role: m.role, content: m.content }));
+    let reply;
+    if (mediaFiles.length > 0) {
+      reply = await callClaudeVision(apiMessages, mediaFiles);
+    } else {
+      reply = await callActiveAI(apiMessages);
+    }
+    setMediaFiles([]);
+    setMessages([...next, { role: "assistant", content: reply }]);
+    setLoading(false);
+  };
+
+  const canSend = (input.trim() || mediaFiles.length > 0) && !loading;
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      {/* AI indicator + quick prompts */}
-      <div style={{ padding: "8px 14px", borderBottom: "1px solid rgba(255,220,100,0.1)" }}>
-        {/* Active AI badge */}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7 }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}
+      onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave}>
+
+      {/* Drag overlay */}
+      {isDragging && (
+        <div style={{ position: "absolute", inset: 0, background: `${aiColor}18`, border: `2px dashed ${aiColor}`, borderRadius: 24, zIndex: 99, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+          <div style={{ color: aiColor, fontSize: 16, fontWeight: 700 }}>Thả file vào đây 📎</div>
+        </div>
+      )}
+
+      {/* AI badge + quick prompts */}
+      <div style={{ padding: "8px 14px", borderBottom: "1px solid rgba(255,220,100,0.1)", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", background: activeAI ? aiColor : "#ff6b6b", boxShadow: `0 0 5px ${activeAI ? aiColor : "#ff6b6b"}` }} />
           <span style={{ color: activeAI ? aiColor : "#ff6b6b", fontSize: 11, fontWeight: 600 }}>
-            {activeAI ? `Đang dùng: ${aiName}` : "Chưa kết nối AI — vào tab ⬡ Kết Nối"}
+            {activeAI ? `${aiName} · Hỗ trợ hình ảnh & video` : "Chưa kết nối AI"}
           </span>
         </div>
-        <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 2 }}>
-          {QUICK_PROMPTS.map(q => <button key={q} onClick={() => send(q)} style={{ flexShrink: 0, background: `${aiColor}14`, border: `1px solid ${aiColor}33`, borderRadius: 20, color: aiColor, fontSize: 11, padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap", fontFamily: "inherit" }}>{q}</button>)}
+        <div style={{ display: "flex", gap: 5, overflowX: "auto", paddingBottom: 2 }}>
+          {QUICK_PROMPTS.map(q => <button key={q} onClick={() => send(q)} style={{ flexShrink: 0, background: `${aiColor}14`, border: `1px solid ${aiColor}33`, borderRadius: 20, color: aiColor, fontSize: 11, padding: "4px 9px", cursor: "pointer", whiteSpace: "nowrap", fontFamily: "inherit" }}>{q}</button>)}
         </div>
       </div>
-      <div style={{ flex: 1, overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: 10 }}>
+
+      {/* Messages */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
         {messages.map((m, i) => (
-          <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
-            <div style={{ maxWidth: "82%", padding: "10px 14px", borderRadius: m.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px", background: m.role === "user" ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,255,255,0.06)", color: m.role === "user" ? "#1a1410" : "#e8dcc8", fontSize: 13.5, lineHeight: 1.55, border: m.role === "assistant" ? `1px solid ${aiColor}22` : "none", whiteSpace: "pre-wrap" }}>{m.content}</div>
+          <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", flexDirection: "column", alignItems: m.role === "user" ? "flex-end" : "flex-start", gap: 5 }}>
+            {/* Media preview in message */}
+            {m.media?.length > 0 && (
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap", justifyContent: "flex-end", maxWidth: "85%" }}>
+                {m.media.map((med, mi) => (
+                  <div key={mi} style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: `1px solid ${aiColor}44` }}>
+                    {med.type === "image"
+                      ? <img src={med.url} alt={med.name} style={{ width: 120, height: 90, objectFit: "cover", display: "block" }} />
+                      : <div style={{ width: 120, height: 70, background: "rgba(255,255,255,0.06)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                          <span style={{ fontSize: 22 }}>🎬</span>
+                          <span style={{ color: "#888", fontSize: 10, textAlign: "center", padding: "0 4px" }}>{med.name.slice(0, 16)}</span>
+                        </div>
+                    }
+                  </div>
+                ))}
+              </div>
+            )}
+            {m.content && (
+              <div style={{ maxWidth: "82%", padding: "9px 13px", borderRadius: m.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px", background: m.role === "user" ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,255,255,0.06)", color: m.role === "user" ? "#1a1410" : "#e8dcc8", fontSize: 13.5, lineHeight: 1.55, border: m.role === "assistant" ? `1px solid ${aiColor}22` : "none", whiteSpace: "pre-wrap" }}>{m.content}</div>
+            )}
           </div>
         ))}
-        {loading && <div style={{ display: "flex", gap: 5, padding: "10px 14px" }}>{[0,1,2].map(i => <div key={i} style={{ width: 7, height: 7, borderRadius: "50%", background: "#ffd86e", animation: "bounce 1.2s infinite", animationDelay: `${i*0.2}s` }} />)}</div>}
+        {loading && <div style={{ display: "flex", gap: 5, padding: "8px 12px" }}>{[0,1,2].map(i => <div key={i} style={{ width: 7, height: 7, borderRadius: "50%", background: aiColor, animation: "bounce 1.2s infinite", animationDelay: `${i*0.2}s` }} />)}</div>}
         <div ref={bottomRef} />
       </div>
-      <div style={{ padding: "10px 14px", borderTop: "1px solid rgba(255,220,100,0.1)", display: "flex", gap: 8 }}>
-        <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()} placeholder="Hỏi bất cứ điều gì..." style={{ flex: 1, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,220,100,0.2)", borderRadius: 24, color: "#e8dcc8", padding: "10px 16px", fontSize: 13.5, outline: "none", fontFamily: "inherit" }} />
-        <button onClick={() => send()} disabled={loading || !input.trim()} style={{ width: 42, height: 42, borderRadius: "50%", background: input.trim() ? "linear-gradient(135deg,#ffd86e,#ffb347)" : "rgba(255,220,100,0.1)", border: "none", color: input.trim() ? "#1a1410" : "#888", fontSize: 18, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>↑</button>
+
+      {/* Media preview strip */}
+      {mediaFiles.length > 0 && (
+        <div style={{ padding: "8px 14px 4px", borderTop: "1px solid rgba(255,220,100,0.08)", display: "flex", gap: 7, overflowX: "auto" }}>
+          {mediaFiles.map((med, i) => (
+            <div key={i} style={{ position: "relative", flexShrink: 0 }}>
+              {med.type === "image"
+                ? <img src={med.url} alt="" style={{ width: 60, height: 60, objectFit: "cover", borderRadius: 8, border: `1px solid ${aiColor}44`, display: "block" }} />
+                : <div style={{ width: 60, height: 60, borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 }}>
+                    <span style={{ fontSize: 18 }}>🎬</span>
+                    <span style={{ color: "#777", fontSize: 9 }}>{(med.size/1024/1024).toFixed(1)}MB</span>
+                  </div>
+              }
+              <button onClick={() => removeMedia(i)} style={{ position: "absolute", top: -5, right: -5, width: 18, height: 18, borderRadius: "50%", background: "#ff6b6b", border: "none", color: "#fff", fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 }}>✕</button>
+            </div>
+          ))}
+          <div style={{ color: "#555", fontSize: 10, alignSelf: "center", flexShrink: 0 }}>{mediaFiles.length}/4</div>
+        </div>
+      )}
+
+      {/* Input bar */}
+      <div style={{ padding: "8px 14px 10px", borderTop: mediaFiles.length > 0 ? "none" : "1px solid rgba(255,220,100,0.1)", display: "flex", alignItems: "flex-end", gap: 8 }}>
+        {/* Hidden file input */}
+        <input ref={fileInputRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={e => processFiles(e.target.files)} />
+
+        {/* Attach button */}
+        <button onClick={() => fileInputRef.current?.click()} style={{ width: 38, height: 38, borderRadius: 12, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#888", fontSize: 17, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.2s" }}
+          onMouseEnter={e => { e.target.style.borderColor = aiColor; e.target.style.color = aiColor; }}
+          onMouseLeave={e => { e.target.style.borderColor = "rgba(255,255,255,0.1)"; e.target.style.color = "#888"; }}>
+          📎
+        </button>
+
+        {/* Text input */}
+        <textarea value={input} onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          placeholder="Nhắn tin, hoặc kéo thả ảnh/video vào đây..." rows={1}
+          style={{ flex: 1, background: "rgba(255,255,255,0.06)", border: `1px solid ${isDragging ? aiColor : "rgba(255,220,100,0.2)"}`, borderRadius: 18, color: "#e8dcc8", padding: "10px 14px", fontSize: 13, outline: "none", fontFamily: "inherit", resize: "none", lineHeight: 1.4, maxHeight: 80, overflowY: "auto" }}
+        />
+
+        {/* Send button */}
+        <button onClick={() => send()} disabled={!canSend} style={{ width: 38, height: 38, borderRadius: "50%", background: canSend ? `linear-gradient(135deg,${aiColor},${aiColor}bb)` : "rgba(255,220,100,0.08)", border: "none", color: canSend ? "#1a1410" : "#555", fontSize: 16, cursor: canSend ? "pointer" : "not-allowed", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.2s" }}>↑</button>
       </div>
     </div>
   );
