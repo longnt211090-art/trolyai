@@ -231,8 +231,7 @@ async function callExternalAI(platform, apiKey, model, messages, systemPrompt = 
 async function generateImageGemini(prompt) {
   const saved = getSavedConfigs();
   const geminiKey = saved["gemini"]?.apiKey;
-  if (!geminiKey) return { error: "⚠️ Cần kết nối Gemini API trước!
-Vào tab ⬡ Kết Nối → Gemini → nhập key." };
+  if (!geminiKey) return { error: "⚠️ Cần kết nối Gemini API trước! Vào tab Kết Nối → Gemini → nhập key." };
 
   const model = "gemini-2.5-flash-image";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
