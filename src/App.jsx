@@ -61,10 +61,10 @@ const AI_PLATFORMS = [
     id: "gemini", name: "Gemini", company: "Google",
     color: "#4285f4", icon: "◈",
     endpoint: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-    models: ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
-    defaultModel: "gemini-2.0-flash",
+    models: ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
+    defaultModel: "gemini-2.5-flash",
     docs: "https://aistudio.google.com/app/apikey",
-    desc: "Gemini 2.0 Flash, 1.5 Pro...",
+    desc: "Gemini 2.5 Flash, 2.0 Flash...",
     headerKey: "X-Goog-Api-Key",
     bodyBuilder: (model, messages, system) => ({
       system_instruction: { parts: [{ text: system || "Bạn là trợ lý AI hữu ích. Trả lời tiếng Việt." }] },
