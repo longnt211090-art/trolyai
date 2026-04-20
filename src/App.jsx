@@ -155,10 +155,23 @@ const AI_PLATFORMS = [
     id: "gemini", name: "Gemini", company: "Google",
     color: "#4285f4", icon: "◈",
     endpoint: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-    models: ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
+    models: [
+      // ── Gemini 3.x (mới nhất) ──
+      "gemini-3.1-pro-preview",        // Flagship mạnh nhất, reasoning cao
+      "gemini-3.1-flash-lite-preview", // Flash-Lite thế hệ 3, tiết kiệm
+      "gemini-3-flash-preview",        // Flash thế hệ 3, đa năng
+      // ── Gemini 2.5 (stable) ──
+      "gemini-2.5-pro",                // Pro ổn định, reasoning tốt
+      "gemini-2.5-flash",              // ⭐ Khuyên dùng - cân bằng tốc độ/chất lượng
+      "gemini-2.5-flash-lite",         // Nhanh nhất, tiết kiệm nhất
+      // ── Image Generation ──
+      "gemini-3.1-flash-image-preview",// Nano Banana 2 - ảnh 4K mới nhất
+      "gemini-2.5-flash-image",        // Nano Banana - ảnh ổn định
+      "gemini-2.0-flash-exp-image-generation", // Free tier image gen
+    ],
     defaultModel: "gemini-2.5-flash",
     docs: "https://aistudio.google.com/app/apikey",
-    desc: "Gemini 2.5 Flash, 2.0 Flash...",
+    desc: "Gemini 3.1 Pro · 2.5 Flash · Image Gen...",
     headerKey: "X-Goog-Api-Key",
     bodyBuilder: (model, messages, system) => ({
       system_instruction: { parts: [{ text: system || "Bạn là trợ lý AI hữu ích. Trả lời tiếng Việt." }] },
@@ -848,7 +861,27 @@ function ConnectTab() {
                     <div>
                       <div style={{ color: "#665f52", fontSize: 10, marginBottom: 6, letterSpacing: 1, textTransform: "uppercase" }}>Model</div>
                       <select value={cfg.model} onChange={e => updateConfig(platform.id, "model", e.target.value)} style={{ width: "100%", background: "#1a160f", border: `1px solid ${platform.color}33`, borderRadius: 9, color: "#e8dcc8", padding: "9px 12px", fontSize: 12, outline: "none", fontFamily: "inherit" }}>
-                        {platform.models.map(m => <option key={m} value={m}>{m}</option>)}
+                        {platform.models.map(m => {
+                          const labels = {
+                            "gemini-3.1-pro-preview": "3.1 Pro Preview — Flagship mạnh nhất",
+                            "gemini-3.1-flash-lite-preview": "3.1 Flash-Lite — Tiết kiệm thế hệ 3",
+                            "gemini-3-flash-preview": "3 Flash — Đa năng thế hệ 3",
+                            "gemini-2.5-pro": "2.5 Pro — Stable, reasoning tốt",
+                            "gemini-2.5-flash": "2.5 Flash ⭐ — Khuyên dùng",
+                            "gemini-2.5-flash-lite": "2.5 Flash-Lite — Nhanh & rẻ nhất",
+                            "gemini-3.1-flash-image-preview": "🎨 3.1 Flash Image — Ảnh 4K mới nhất",
+                            "gemini-2.5-flash-image": "🎨 2.5 Flash Image — Nano Banana",
+                            "gemini-2.0-flash-exp-image-generation": "🎨 2.0 Flash Image — Free tier",
+                            "gpt-4o": "GPT-4o — Mạnh nhất OpenAI",
+                            "gpt-4o-mini": "GPT-4o mini — Nhanh & rẻ",
+                            "gpt-4-turbo": "GPT-4 Turbo",
+                            "gpt-3.5-turbo": "GPT-3.5 Turbo — Cơ bản",
+                            "mistral-large-latest": "Mistral Large — Mạnh nhất",
+                            "mistral-small-latest": "Mistral Small — Cân bằng",
+                            "open-mistral-7b": "Mistral 7B — Nhẹ & nhanh",
+                          };
+                          return <option key={m} value={m}>{labels[m] || m}</option>;
+                        })}
                       </select>
                     </div>
                   </>
