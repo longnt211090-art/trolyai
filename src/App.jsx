@@ -233,14 +233,14 @@ async function generateImageGemini(prompt) {
   const geminiKey = saved["gemini"]?.apiKey;
   if (!geminiKey) return { error: "⚠️ Cần kết nối Gemini API trước! Vào tab Kết Nối → Gemini → nhập key." };
 
-  const model = "gemini-2.5-flash-image";
+  const model = "gemini-2.0-flash-exp-image-generation";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Goog-Api-Key": geminiKey },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
       }),
     });
